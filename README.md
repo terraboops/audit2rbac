@@ -28,6 +28,10 @@ audit2rbac takes a [Kubernetes audit log](https://kubernetes.io/docs/tasks/debug
     audit2rbac -f https://git.io/v51iG --user bob               > bob-roles.yaml
     audit2rbac -f https://git.io/v51iG --serviceaccount ns1:sa1 > sa1-roles.yaml
     ```
+    Alternatively, use `--output-filename` to write the output to a file. The file is only written once all objects are generated, replacing any existing file:
+    ```sh
+    audit2rbac -f https://git.io/v51iG --user alice --output-filename alice-roles.yaml
+    ```
 4. Inspect the output to verify the generated roles/bindings:
     ```sh
     more alice-roles.yaml
