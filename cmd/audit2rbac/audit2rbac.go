@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	goruntime "runtime"
 	"strings"
@@ -59,31 +60,14 @@ func NewAudit2RBACCommand(stdout, stderr io.Writer) *cobra.Command {
 
 	showVersion := false
 
-	outputFilename := ""
-
 	cmd := &cobra.Command{
 		Use:   "audit2rbac --filename=audit.log [ --user=bob | --serviceaccount=my-namespace:my-sa ]",
 		Short: "",
 		Long:  "",
 		Run: func(cmd *cobra.Command, args []string) {
-			var tmpFile *os.File
-			var err error
-
 			if showVersion {
 				fmt.Fprintln(stdout, "audit2rbac version "+pkg.Version)
 				return
-			}
-
-			if outputFilename != "" {
-
-				tmpFile, err = os.CreateTemp("", "audit2rbac")
-				if err != nil {
-					fmt.Fprintln(stderr, err)
-					fmt.Fprintln(stderr)
-					cmd.Help()
-					os.Exit(1)
-				}
-				options.Stdout = tmpFile
 			}
 
 			checkErr(stderr, options.Complete(serviceAccount, args, name, annotations, labels))
@@ -96,12 +80,11 @@ func NewAudit2RBACCommand(stdout, stderr io.Writer) *cobra.Command {
 			}
 
 			checkErr(stderr, options.Run())
-			checkErr(stderr, os.Rename(tmpFile.Name(), outputFilename))
 		},
 	}
 
 	cmd.Flags().StringArrayVarP(&options.AuditSources, "filename", "f", options.AuditSources, "File, URL, or - for STDIN to read audit events from")
-	cmd.Flags().StringVar(&outputFilename, "output-filename", name, "File to write output manifests to")
+	cmd.Flags().StringVar(&options.OutputFilename, "output-filename", options.OutputFilename, "File to write generated objects to, instead of STDOUT")
 
 	cmd.Flags().StringVar(&options.User, "user", options.User, "User to filter audit events to and generate role bindings for")
 	cmd.Flags().StringVar(&serviceAccount, "serviceaccount", serviceAccount, "Service account to filter audit events to and generate role bindings for, in format <namespace>:<name>")
@@ -137,6 +120,8 @@ type Audit2RBACOptions struct {
 
 	// Directory to write generated roles to. Defaults to current directory.
 	GeneratedPath string
+	// File to write generated objects to. Defaults to Stdout if empty.
+	OutputFilename string
 	// Name for generated objects. Defaults to "audit2rbac:<user>"
 	Name string
 	// Labels to apply to generated object names.
@@ -232,6 +217,67 @@ func (a *Audit2RBACOptions) Validate() error {
 	return nil
 }
 
+func outputObjects(w io.Writer, generated *pkg.RBACObjects) error {
+	firstSeparator := true
+	printSeparator := func() error {
+		if firstSeparator {
+			firstSeparator = false
+			return nil
+		}
+		_, err := fmt.Fprintln(w, "---")
+		return err
+	}
+	objs := []runtime.Object{}
+	for _, obj := range generated.Roles {
+		objs = append(objs, obj)
+	}
+	for _, obj := range generated.ClusterRoles {
+		objs = append(objs, obj)
+	}
+	for _, obj := range generated.RoleBindings {
+		objs = append(objs, obj)
+	}
+	for _, obj := range generated.ClusterRoleBindings {
+		objs = append(objs, obj)
+	}
+	for _, obj := range objs {
+		if err := printSeparator(); err != nil {
+			return err
+		}
+		if err := pkg.Output(w, obj, "yaml"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// writeFile writes to a temporary file in the same directory as filename,
+// and only renames it into place once writing and closing have succeeded,
+// so a failed run never leaves a truncated or partially written file behind.
+func writeFile(filename string, write func(w io.Writer) error) (err error) {
+	f, err := os.CreateTemp(filepath.Dir(filename), "."+filepath.Base(filename)+".tmp")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
+		}
+	}()
+	// CreateTemp uses 0600, generated manifests are not sensitive
+	if err := f.Chmod(0644); err != nil {
+		return err
+	}
+	if err := write(f); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), filename)
+}
+
 func (a *Audit2RBACOptions) Run() error {
 	hasErrors := false
 
@@ -305,29 +351,14 @@ func (a *Audit2RBACOptions) Run() error {
 
 	fmt.Fprintln(a.Stderr, "Generating roles...")
 
-	firstSeparator := true
-	printSeparator := func() {
-		if firstSeparator {
-			firstSeparator = false
-			return
+	if len(a.OutputFilename) > 0 {
+		if err := writeFile(a.OutputFilename, func(w io.Writer) error { return outputObjects(w, generated) }); err != nil {
+			return err
 		}
-		fmt.Fprintln(a.Stdout, "---")
-	}
-	for _, obj := range generated.Roles {
-		printSeparator()
-		pkg.Output(a.Stdout, obj, "yaml")
-	}
-	for _, obj := range generated.ClusterRoles {
-		printSeparator()
-		pkg.Output(a.Stdout, obj, "yaml")
-	}
-	for _, obj := range generated.RoleBindings {
-		printSeparator()
-		pkg.Output(a.Stdout, obj, "yaml")
-	}
-	for _, obj := range generated.ClusterRoleBindings {
-		printSeparator()
-		pkg.Output(a.Stdout, obj, "yaml")
+	} else {
+		if err := outputObjects(a.Stdout, generated); err != nil {
+			return err
+		}
 	}
 
 	fmt.Fprintln(a.Stderr, "Complete!")
